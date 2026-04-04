@@ -624,7 +624,8 @@ parse_server_interfaces(struct network_interface_info_ioctl_rsp *buf,
 
 	while (bytes_left >= (ssize_t)sizeof(*p)) {
 		memset(&tmp_iface, 0, sizeof(tmp_iface));
-		tmp_iface.speed = le64_to_cpu(p->LinkSpeed);
+		/* default to 1Gbps when link speed is unset */
+		tmp_iface.speed = le64_to_cpu(p->LinkSpeed) ?: 1000000000;
 		tmp_iface.rdma_capable = le32_to_cpu(p->Capability & RDMA_CAPABLE) ? 1 : 0;
 		tmp_iface.rss_capable = le32_to_cpu(p->Capability & RSS_CAPABLE) ? 1 : 0;
 
@@ -1124,7 +1125,7 @@ smb2_set_ea(const unsigned int xid, struct cifs_tcon *tcon,
 	struct cifs_fid fid;
 	unsigned int size[1];
 	void *data[1];
-	struct smb2_file_full_ea_info *ea = NULL;
+	struct smb2_file_full_ea_info *ea;
 	struct smb2_query_info_rsp *rsp;
 	int rc, used_len = 0;
 	int retries = 0, cur_sleep = 1;
@@ -1145,6 +1146,7 @@ replay_again:
 	if (!utf16_path)
 		return -ENOMEM;
 
+	ea = NULL;
 	resp_buftype[0] = resp_buftype[1] = resp_buftype[2] = CIFS_NO_BUFFER;
 	vars = kzalloc(sizeof(*vars), GFP_KERNEL);
 	if (!vars) {
@@ -3002,11 +3004,11 @@ smb2_get_dfs_refer(const unsigned int xid, struct cifs_ses *ses,
 	return rc;
 }
 
-static struct cifs_ntsd *
+static struct smb_ntsd *
 get_smb2_acl_by_fid(struct cifs_sb_info *cifs_sb,
 		    const struct cifs_fid *cifsfid, u32 *pacllen, u32 info)
 {
-	struct cifs_ntsd *pntsd = NULL;
+	struct smb_ntsd *pntsd = NULL;
 	unsigned int xid;
 	int rc = -EOPNOTSUPP;
 	struct tcon_link *tlink = cifs_sb_tlink(cifs_sb);
@@ -3031,11 +3033,11 @@ get_smb2_acl_by_fid(struct cifs_sb_info *cifs_sb,
 
 }
 
-static struct cifs_ntsd *
+static struct smb_ntsd *
 get_smb2_acl_by_path(struct cifs_sb_info *cifs_sb,
 		     const char *path, u32 *pacllen, u32 info)
 {
-	struct cifs_ntsd *pntsd = NULL;
+	struct smb_ntsd *pntsd = NULL;
 	u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
 	unsigned int xid;
 	int rc;
@@ -3098,7 +3100,7 @@ get_smb2_acl_by_path(struct cifs_sb_info *cifs_sb,
 }
 
 static int
-set_smb2_acl(struct cifs_ntsd *pnntsd, __u32 acllen,
+set_smb2_acl(struct smb_ntsd *pnntsd, __u32 acllen,
 		struct inode *inode, const char *path, int aclflag)
 {
 	u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
@@ -3156,12 +3158,12 @@ set_smb2_acl(struct cifs_ntsd *pnntsd, __u32 acllen,
 }
 
 /* Retrieve an ACL from the server */
-static struct cifs_ntsd *
+static struct smb_ntsd *
 get_smb2_acl(struct cifs_sb_info *cifs_sb,
 	     struct inode *inode, const char *path,
 	     u32 *pacllen, u32 info)
 {
-	struct cifs_ntsd *pntsd = NULL;
+	struct smb_ntsd *pntsd = NULL;
 	struct cifsFileInfo *open_file = NULL;
 
 	if (inode && !(info & SACL_SECINFO))
@@ -4017,7 +4019,7 @@ map_oplock_to_lease(u8 oplock)
 	if (oplock == SMB2_OPLOCK_LEVEL_EXCLUSIVE)
 		return SMB2_LEASE_WRITE_CACHING_LE | SMB2_LEASE_READ_CACHING_LE;
 	else if (oplock == SMB2_OPLOCK_LEVEL_II)
-		return SMB2_LEASE_READ_CACHING_LE;
+		return SMB2_LEASE_READ_CACHING_LE | SMB2_LEASE_HANDLE_CACHING_LE;
 	else if (oplock == SMB2_OPLOCK_LEVEL_BATCH)
 		return SMB2_LEASE_HANDLE_CACHING_LE | SMB2_LEASE_READ_CACHING_LE |
 		       SMB2_LEASE_WRITE_CACHING_LE;

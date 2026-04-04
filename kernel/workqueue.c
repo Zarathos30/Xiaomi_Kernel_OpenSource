@@ -56,11 +56,6 @@
 
 #include "workqueue_internal.h"
 
-#include <trace/hooks/dtask.h>
-#include <trace/hooks/wqlockup.h>
-/* events/workqueue.h uses default TRACE_INCLUDE_PATH */
-#undef TRACE_INCLUDE_PATH
-
 enum {
 	/*
 	 * worker_pool flags
@@ -364,10 +359,6 @@ static const char *wq_affn_names[WQ_AFFN_NR_TYPES] = {
  */
 static unsigned long wq_cpu_intensive_thresh_us = ULONG_MAX;
 module_param_named(cpu_intensive_thresh_us, wq_cpu_intensive_thresh_us, ulong, 0644);
-#ifdef CONFIG_WQ_CPU_INTENSIVE_REPORT
-static unsigned int wq_cpu_intensive_warning_thresh = 4;
-module_param_named(cpu_intensive_warning_thresh, wq_cpu_intensive_warning_thresh, uint, 0644);
-#endif
 
 /* see the comment above the definition of WQ_POWER_EFFICIENT */
 static bool wq_power_efficient = IS_ENABLED(CONFIG_WQ_POWER_EFFICIENT_DEFAULT);
@@ -451,9 +442,6 @@ static void show_one_worker_pool(struct worker_pool *pool);
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/workqueue.h>
-
-EXPORT_TRACEPOINT_SYMBOL_GPL(workqueue_execute_start);
-EXPORT_TRACEPOINT_SYMBOL_GPL(workqueue_execute_end);
 
 #define assert_rcu_or_pool_mutex()					\
 	RCU_LOCKDEP_WARN(!rcu_read_lock_held() &&			\
@@ -1155,8 +1143,6 @@ static bool kick_pool(struct worker_pool *pool)
 		}
 	}
 #endif
-	trace_android_vh_wq_wake_idle_worker(p, list_first_entry(&pool->worklist,
-					struct work_struct, entry));
 	wake_up_process(p);
 	return true;
 }
@@ -1210,13 +1196,11 @@ restart:
 		u64 cnt;
 
 		/*
-		 * Start reporting from the warning_thresh and back off
+		 * Start reporting from the fourth time and back off
 		 * exponentially.
 		 */
 		cnt = atomic64_inc_return_relaxed(&ent->cnt);
-		if (wq_cpu_intensive_warning_thresh &&
-		    cnt >= wq_cpu_intensive_warning_thresh &&
-		    is_power_of_2(cnt + 1 - wq_cpu_intensive_warning_thresh))
+		if (cnt >= 4 && is_power_of_2(cnt))
 			printk_deferred(KERN_WARNING "workqueue: %ps hogged CPU for >%luus %llu times, consider switching to WQ_UNBOUND\n",
 					ent->func, wq_cpu_intensive_thresh_us,
 					atomic64_read(&ent->cnt));
@@ -1245,12 +1229,10 @@ restart:
 
 	ent = &wci_ents[wci_nr_ents++];
 	ent->func = func;
-	atomic64_set(&ent->cnt, 0);
+	atomic64_set(&ent->cnt, 1);
 	hash_add_rcu(wci_hash, &ent->hash_node, (unsigned long)func);
 
 	raw_spin_unlock(&wci_lock);
-
-	goto restart;
 }
 
 #else	/* CONFIG_WQ_CPU_INTENSIVE_REPORT */
@@ -1803,8 +1785,6 @@ retry:
 	/* pwq determined, queue */
 	trace_workqueue_queue_work(req_cpu, pwq, work);
 
-	trace_android_vh_wq_queue_work(work, wq->name, wq->flags, cpu);
-
 	if (WARN_ON(!list_empty(&work->entry)))
 		goto out;
 
@@ -2225,7 +2205,6 @@ static struct worker *create_worker(struct worker_pool *pool)
 	}
 
 	set_user_nice(worker->task, pool->attrs->nice);
-	trace_android_rvh_create_worker(worker->task, pool->attrs);
 	kthread_bind_mask(worker->task, pool_allowed_cpus(pool));
 
 	/* successful, attach the worker to the pool */
@@ -2562,6 +2541,7 @@ __acquires(&pool->lock)
 	struct pool_workqueue *pwq = get_work_pwq(work);
 	struct worker_pool *pool = worker->pool;
 	unsigned long work_data;
+	int lockdep_start_depth, rcu_start_depth;
 #ifdef CONFIG_LOCKDEP
 	/*
 	 * It is permissible to free the struct work_struct from
@@ -2624,6 +2604,8 @@ __acquires(&pool->lock)
 	pwq->stats[PWQ_STAT_STARTED]++;
 	raw_spin_unlock_irq(&pool->lock);
 
+	rcu_start_depth = rcu_preempt_depth();
+	lockdep_start_depth = lockdep_depth(current);
 	lock_map_acquire(&pwq->wq->lockdep_map);
 	lock_map_acquire(&lockdep_map);
 	/*
@@ -2659,12 +2641,15 @@ __acquires(&pool->lock)
 	lock_map_release(&lockdep_map);
 	lock_map_release(&pwq->wq->lockdep_map);
 
-	if (unlikely(in_atomic() || lockdep_depth(current) > 0 ||
-		     rcu_preempt_depth() > 0)) {
-		pr_err("BUG: workqueue leaked lock or atomic: %s/0x%08x/%d/%d\n"
-		       "     last function: %ps\n",
-		       current->comm, preempt_count(), rcu_preempt_depth(),
-		       task_pid_nr(current), worker->current_func);
+	if (unlikely((worker->task && in_atomic()) ||
+		     lockdep_depth(current) != lockdep_start_depth ||
+		     rcu_preempt_depth() != rcu_start_depth)) {
+		pr_err("BUG: workqueue leaked atomic, lock or RCU: %s[%d]\n"
+		       "     preempt=0x%08x lock=%d->%d RCU=%d->%d workfn=%ps\n",
+		       current->comm, task_pid_nr(current), preempt_count(),
+		       lockdep_start_depth, lockdep_depth(current),
+		       rcu_start_depth, rcu_preempt_depth(),
+		       worker->current_func);
 		debug_show_held_locks(current);
 		dump_stack();
 	}
@@ -2962,23 +2947,27 @@ repeat:
  * check_flush_dependency - check for flush dependency sanity
  * @target_wq: workqueue being flushed
  * @target_work: work item being flushed (NULL for workqueue flushes)
+ * @from_cancel: are we called from the work cancel path
  *
  * %current is trying to flush the whole @target_wq or @target_work on it.
- * If @target_wq doesn't have %WQ_MEM_RECLAIM, verify that %current is not
- * reclaiming memory or running on a workqueue which doesn't have
- * %WQ_MEM_RECLAIM as that can break forward-progress guarantee leading to
- * a deadlock.
+ * If this is not the cancel path (which implies work being flushed is either
+ * already running, or will not be at all), check if @target_wq doesn't have
+ * %WQ_MEM_RECLAIM and verify that %current is not reclaiming memory or running
+ * on a workqueue which doesn't have %WQ_MEM_RECLAIM as that can break forward-
+ * progress guarantee leading to a deadlock.
  */
 static void check_flush_dependency(struct workqueue_struct *target_wq,
-				   struct work_struct *target_work)
+				   struct work_struct *target_work,
+				   bool from_cancel)
 {
-	work_func_t target_func = target_work ? target_work->func : NULL;
+	work_func_t target_func;
 	struct worker *worker;
 
-	if (target_wq->flags & WQ_MEM_RECLAIM)
+	if (from_cancel || target_wq->flags & WQ_MEM_RECLAIM)
 		return;
 
 	worker = current_wq_worker();
+	target_func = target_work ? target_work->func : NULL;
 
 	WARN_ONCE(current->flags & PF_MEMALLOC,
 		  "workqueue: PF_MEMALLOC task %d(%s) is flushing !WQ_MEM_RECLAIM %s:%ps",
@@ -3144,6 +3133,19 @@ static bool flush_workqueue_prep_pwqs(struct workqueue_struct *wq,
 	return wait;
 }
 
+static void touch_wq_lockdep_map(struct workqueue_struct *wq)
+{
+	lock_map_acquire(&wq->lockdep_map);
+	lock_map_release(&wq->lockdep_map);
+}
+
+static void touch_work_lockdep_map(struct work_struct *work,
+				   struct workqueue_struct *wq)
+{
+	lock_map_acquire(&work->lockdep_map);
+	lock_map_release(&work->lockdep_map);
+}
+
 /**
  * __flush_workqueue - ensure that any scheduled work has run to completion.
  * @wq: workqueue to flush
@@ -3163,8 +3165,7 @@ void __flush_workqueue(struct workqueue_struct *wq)
 	if (WARN_ON(!wq_online))
 		return;
 
-	lock_map_acquire(&wq->lockdep_map);
-	lock_map_release(&wq->lockdep_map);
+	touch_wq_lockdep_map(wq);
 
 	mutex_lock(&wq->mutex);
 
@@ -3211,13 +3212,11 @@ void __flush_workqueue(struct workqueue_struct *wq)
 		list_add_tail(&this_flusher.list, &wq->flusher_overflow);
 	}
 
-	check_flush_dependency(wq, NULL);
+	check_flush_dependency(wq, NULL, false);
 
 	mutex_unlock(&wq->mutex);
 
-	trace_android_vh_flush_wq_wait_start(wq);
 	wait_for_completion(&this_flusher.done);
-	trace_android_vh_flush_wq_wait_finish(wq);
 
 	/*
 	 * Wake-up-and-cascade phase
@@ -3365,6 +3364,7 @@ static bool start_flush_work(struct work_struct *work, struct wq_barrier *barr,
 	struct worker *worker = NULL;
 	struct worker_pool *pool;
 	struct pool_workqueue *pwq;
+	struct workqueue_struct *wq;
 
 	might_sleep();
 
@@ -3388,10 +3388,13 @@ static bool start_flush_work(struct work_struct *work, struct wq_barrier *barr,
 		pwq = worker->current_pwq;
 	}
 
-	check_flush_dependency(pwq->wq, work);
+	wq = pwq->wq;
+	check_flush_dependency(wq, work, from_cancel);
 
 	insert_wq_barrier(pwq, barr, work, worker);
 	raw_spin_unlock_irq(&pool->lock);
+
+	touch_work_lockdep_map(work, wq);
 
 	/*
 	 * Force a lock recursion deadlock when using flush_work() inside a
@@ -3402,11 +3405,9 @@ static bool start_flush_work(struct work_struct *work, struct wq_barrier *barr,
 	 * workqueues the deadlock happens when the rescuer stalls, blocking
 	 * forward progress.
 	 */
-	if (!from_cancel &&
-	    (pwq->wq->saved_max_active == 1 || pwq->wq->rescuer)) {
-		lock_map_acquire(&pwq->wq->lockdep_map);
-		lock_map_release(&pwq->wq->lockdep_map);
-	}
+	if (!from_cancel && (wq->saved_max_active == 1 || wq->rescuer))
+		touch_wq_lockdep_map(wq);
+
 	rcu_read_unlock();
 	return true;
 already_gone:
@@ -3425,13 +3426,8 @@ static bool __flush_work(struct work_struct *work, bool from_cancel)
 	if (WARN_ON(!work->func))
 		return false;
 
-	lock_map_acquire(&work->lockdep_map);
-	lock_map_release(&work->lockdep_map);
-
 	if (start_flush_work(work, &barr, from_cancel)) {
-		trace_android_vh_flush_work_wait_start(work);
 		wait_for_completion(&barr.done);
-		trace_android_vh_flush_work_wait_finish(work);
 		destroy_work_on_stack(&barr.work);
 		return true;
 	} else {
@@ -3740,7 +3736,6 @@ void free_workqueue_attrs(struct workqueue_attrs *attrs)
 		kfree(attrs);
 	}
 }
-EXPORT_SYMBOL_GPL(free_workqueue_attrs);
 
 /**
  * alloc_workqueue_attrs - allocate a workqueue_attrs
@@ -3769,7 +3764,6 @@ fail:
 	free_workqueue_attrs(attrs);
 	return NULL;
 }
-EXPORT_SYMBOL_GPL(alloc_workqueue_attrs);
 
 static void copy_workqueue_attrs(struct workqueue_attrs *to,
 				 const struct workqueue_attrs *from)
@@ -4511,7 +4505,6 @@ int apply_workqueue_attrs(struct workqueue_struct *wq,
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(apply_workqueue_attrs);
 
 /**
  * wq_update_pod - update pod affinity of a wq for CPU hot[un]plug
@@ -4592,7 +4585,6 @@ static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 {
 	bool highpri = wq->flags & WQ_HIGHPRI;
 	int cpu, ret;
-	bool skip = false;
 
 	wq->cpu_pwq = alloc_percpu(struct pool_workqueue *);
 	if (!wq->cpu_pwq)
@@ -4619,10 +4611,6 @@ static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 		return 0;
 	}
 
-	trace_android_rvh_alloc_and_link_pwqs(wq, &ret, &skip);
-	if (skip)
-		goto oem_skip;
-
 	cpus_read_lock();
 	if (wq->flags & __WQ_ORDERED) {
 		ret = apply_workqueue_attrs(wq, ordered_wq_attrs[highpri]);
@@ -4635,7 +4623,6 @@ static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 	}
 	cpus_read_unlock();
 
-oem_skip:
 	/* for unbound pwq, flush the pwq_release_worker ensures that the
 	 * pwq_release_workfn() completes before calling kfree(wq).
 	 */
@@ -4741,7 +4728,6 @@ struct workqueue_struct *alloc_workqueue(const char *fmt,
 	vsnprintf(wq->name, sizeof(wq->name), fmt, args);
 	va_end(args);
 
-	trace_android_rvh_alloc_workqueue(wq, &flags, &max_active);
 	max_active = max_active ?: WQ_DFL_ACTIVE;
 	max_active = wq_clamp_max_active(max_active, flags, wq->name);
 
@@ -5417,7 +5403,6 @@ void wq_worker_comm(char *buf, size_t size, struct task_struct *task)
 
 	mutex_unlock(&wq_pool_attach_mutex);
 }
-EXPORT_SYMBOL_GPL(wq_worker_comm);
 
 #ifdef CONFIG_SMP
 
@@ -6364,9 +6349,6 @@ static struct timer_list wq_watchdog_timer;
 static unsigned long wq_watchdog_touched = INITIAL_JIFFIES;
 static DEFINE_PER_CPU(unsigned long, wq_watchdog_touched_cpu) = INITIAL_JIFFIES;
 
-static unsigned int wq_panic_on_stall;
-module_param_named(panic_on_stall, wq_panic_on_stall, uint, 0644);
-
 /*
  * Show workers that might prevent the processing of pending work items.
  * The only candidates are CPU-bound workers in the running state.
@@ -6416,16 +6398,6 @@ static void show_cpu_pools_hogs(void)
 	}
 
 	rcu_read_unlock();
-}
-
-static void panic_on_wq_watchdog(void)
-{
-	static unsigned int wq_stall;
-
-	if (wq_panic_on_stall) {
-		wq_stall++;
-		BUG_ON(wq_stall >= wq_panic_on_stall);
-	}
 }
 
 static void wq_watchdog_reset_touched(void)
@@ -6487,7 +6459,6 @@ static void wq_watchdog_timer_fn(struct timer_list *unused)
 			pr_cont_pool_info(pool);
 			pr_cont(" stuck for %us!\n",
 				jiffies_to_msecs(now - pool_ts) / 1000);
-			trace_android_vh_wq_lockup_pool(pool->cpu, pool_ts);
 		}
 
 
@@ -6500,9 +6471,6 @@ static void wq_watchdog_timer_fn(struct timer_list *unused)
 
 	if (cpu_pool_stall)
 		show_cpu_pools_hogs();
-
-	if (lockup_detected)
-		panic_on_wq_watchdog();
 
 	wq_watchdog_reset_touched();
 	mod_timer(&wq_watchdog_timer, jiffies + thresh);

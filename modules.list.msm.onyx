@@ -1,10 +1,5 @@
-# MIUI ADD: Stability_DebugEnhance
-boottime.ko
-# END Stability_DebugEnhance
+# SPDX-License-Identifier: GPL-2.0-only
+# modules.list for Onyx - A16 port
+# These modules are shipped as prebuilt vendor_dlkm from the stock ROM
+# and must NOT be compiled in-tree from kernel source.
 miev.ko
-zram.ko
-zsmalloc.ko
-mi_ubt.ko
-printk_enhance.ko
-rt_mod.ko
-binder_gki.ko
